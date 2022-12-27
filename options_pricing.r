@@ -1,73 +1,81 @@
-### Modele d'arbre binomial ###
-
-# Proba neutre au risque
-Q <- function(escompte, u, d) (1/escompte - d) / (u - d)
-
-# Fonction de paiement selon la valeur de l'actif, le strike price, et le type
-# Pour les options exotiques, fournir la transformation des valeurs de l'actif
-# applicable pour la variable S
-pmt <- function(S, k, type) {
-  if(type=="put") return(max(k-S, 0))
-  else if(type=="call") return(max(S-k, 0))
-}
-
-# Valeur de l'action au temps t, noeud j, j appartient a {0,1,...,t}
-Stj <- function(S0, u, d, j_max, j) S0*u**j*d**(j_max-j)
-
-# Valeur de continuation au temps t
-VCt <- function(Cu, Cd, q, escompte) escompte*(q*Cu + (1-q)*Cd)
-
-# Put/call americain (pmt_prem=T) ou europeen (pmt_prem=F)
-prix_vanille <- function(n_periodes, u, d, S0, k, escompte, type, pmt_prem=F) {
-  Ctj = replicate(n_periodes, list())
-  q = Q(escompte, u, d)
-  Ctj[[n_periodes]] = lapply(0:n_periodes, function(j) pmt(Stj(S0,u,d,n_periodes,j), k, type))
-  # Evaluation recursive
-  for(t in (n_periodes-1):1) {
-    Ctj[[t]] = rep(0,t+1)
-    for(j in t:0) {
-      VC = VCt(Ctj[[t+1]][[j+2]], Ctj[[t+1]][[j+1]], q, escompte)
-      if(pmt_prem) Ctj[[t]][[j+1]] = max(VC, pmt(Stj(S0,u,d,t,j), k, type))
-      else Ctj[[t]][[j+1]] = VC
-    }
+### Price of a European vanilla option, using the Black-Scholes model
+BSOptionPrice <- function(S, K, r, T_t=1, sigma=1, isput=F, ...) {
+  #####
+  # Arguments:
+  # S := current asset price
+  # K := strike price
+  # r := risk-free annual interest rate, compounded continuously
+  # T_t := time to maturity, in years
+  # sigma := estimated volatility
+  # isput := whether the option is a put (T) or a call (F)
+  #####
+  d1 <- (log(S/K) + (r + sigma^2/2) * T_t) / (sigma * sqrt(T_t))
+  d2 <- d1 - sigma * sqrt(T_t)
+  Ke <- K * exp(-r * T_t)
+  if(isput) {
+    Ke * pnorm(-d2) - S * pnorm(-d1)
+  } else {
+    S * pnorm(d1) - Ke * pnorm(d2)
   }
-  return(VCt(Ctj[[1]][2], Ctj[[1]][1], q, escompte))
-}
-prix_vanille(n_periodes=3, u=1.1, d=0.9, S0=100, k=100,
-             escompte=exp(-0.05), type="put", pmt_prem=T)
-
-
-# Generateur de chemins - pour options exotiques
-gen_path <- function(cur_path, u, d, n_restant) {
-  n = dim(cur_path)[1]
-  j = dim(cur_path)[2]
-  ups = cur_path[,j]*u
-  downs = cur_path[,j]*d
-  cur_path = cbind(rbind(cur_path, cur_path),
-                   c(ups, downs))
-  if(n_restant>1) cur_path = gen_path(cur_path, u, d, n_restant-1)
-  return(cur_path)
 }
 
-# Options dont le paiement a l'echeance est base sur une fonction du chemin des prix (parametre FUN)
-prix_exotique <- function(n_periodes, u, d, S0, k, escompte, type, FUN=mean, exclure=c(1)) {
-  chemins = gen_path(as.matrix(S0), u, d, n_periodes)
-  n = dim(chemins)[1]
-  q = Q(escompte, u, d)
-  print(paste("q =",q))
-  S = ups = proba_NaR = pmt = rep(0,n)
-  for(i in 1:n) {
-    ups[i] = sum(chemins[i,2:(n_periodes+1)]>chemins[i,1:n_periodes])
-    proba_NaR[i] = q**ups[i]*(1-q)**(n_periodes-ups[i])
-    if(length(exclure)==0) S[i] = FUN(chemins[i,])
-    else S[i] = FUN(chemins[i, -exclure])
-    pmt[i] = pmt(S[i], k, type)
+
+### Implied volatility
+BSImplicitVol <- function(OptionPrice, ...) {
+  #####
+  # Arguments:
+  # OptionPrice := current price of the option
+  # ... := arguments required by the BSOptionPrice, except for 'sigma'
+  #####
+  uniroot(
+    f = function(x) BSOptionPrice(sigma=x, ...) - OptionPrice,
+    interval = c(0, 1e10)
+  )$root
+}
+
+
+### Price of a European vanilla option, using the binomial-tree approximation
+
+# This function helps avoid numerical issues when computing tail probabilities
+log_nCr <- function(n, k) {
+  # Returns the natural log of the number of combinations of size 'k' that
+  # can be generated from a set of size 'n'
+  if(k <= 1) log(n)
+  else if(k == n) 0
+  else {
+    sum(log((k+1):n)) - sum(log(1:(n-k)))
   }
-  resume = data.frame(cbind(chemins, ups, S, pmt, proba_NaR))
-  colnames(resume) = c(paste0("t",0:n_periodes), "u", "S", "paiement", "proba")
-  print(resume[order(resume$paiement, decreasing=T), ])
-  return(escompte**n_periodes*sum(proba_NaR * pmt))
 }
-prix_exotique(n_periodes=4, u=1.12, d=0.92, S0=50, k=55, escompte=exp(-0.05),
-               type="call", FUN=max)
 
+BinOptionPrice <- function(S, K, r, T_t=1, mu=0, sigma=1, n=1, isput=F) {
+  #####
+  # Arguments: apart from 'mu' and 'n', all arguments refer to the same
+  # quantities as in the BSOptionPrice() function
+  # mu := annualized drift (mean expected return)
+  # n := number of increments into which to break down the time to maturity
+  #####
+  # Adjustments
+  mu <- mu * T_t
+  sigma <- sigma * sqrt(T_t)
+  # Elementary transformations
+  h <- 1 / n
+  u <- exp(mu * h + sigma * sqrt(h))
+  d <- exp(mu * h - sigma * sqrt(h))
+  q <- (exp(r*h*T_t) - d) / (u - d)
+  # Number of "up" price movements necessary for the option to be at-the-money
+  mK <- (log(K/S) - n * log(d)) / (log(u) - log(d))
+  # Binomial probability mass
+  # NB: we evaluate its log to sidestep numerical issues
+  f_k <- function(k) exp(log_nCr(n, k) + k*log(q) + (n-k)*log(1-q))
+  # Value of the stock at time T
+  S_T <- function(k) S * u^k * d^(n-k)
+  # Payoff function
+  payoff <- function(x) max(0, ifelse(isput, K-x, x-K))
+  # Partial expectation
+  E_payoff_k <- function(k) f_k(k) * payoff(S_T(k))
+  # Value of in-the-money scenarios
+  if(isput) scenarios <- sapply(0:floor(mK), E_payoff_k)
+  else scenarios <- sapply(ceiling(mK):n, E_payoff_k)
+  # Total discounted value
+  exp(-r * T_t) * sum(scenarios)
+}
